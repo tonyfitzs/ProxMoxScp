@@ -1,6 +1,3 @@
-cd /root
-
-cat <<'EOF' > flipfeso-build.sh
 #!/usr/bin/env bash
 #
 # FlipFeso Production VM Builder
