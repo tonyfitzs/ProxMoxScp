@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# FlipFeso Production VM Builder
-# Creates a Debian 12 cloud VM with Docker and SSH key injection on Proxmox VE.
+# FlipFeso Debian 12 VM Builder (cloud-init version)
+# - No libguestfs, no virt-customize
+# - Uses Debian 12 cloud image + Proxmox cloud-init to inject SSH key
 #
 # Spec:
 #  - Debian 12 (cloud image)
@@ -9,31 +10,31 @@
 #  - 32 GB RAM
 #  - 500 GB disk
 #  - Q35 + UEFI (OVMF)
-#  - SSH key injected for root and debian users
-#  - Docker + Docker Compose plugin
+#  - SSH key injected via cloud-init
+#
 
 set -euo pipefail
 
 ############### CONFIG ###############
 
 VM_NAME="flipfeso-prod"
-CORES=8                # vCPU
-RAM_MB=32768           # 32 GB
-DISK_SIZE="500G"       # root disk size
-BRIDGE="vmbr0"         # network bridge
+CORES=8
+RAM_MB=32768
+DISK_SIZE="500G"
+BRIDGE="vmbr0"
 OSTYPE="l26"
 MACHINE="q35"
 CPU_TYPE="host"
-STORAGE=""             # will be selected interactively
+STORAGE=""
 DEBIAN_VERSION="12"
 DEBIAN_CLOUD_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-nocloud-$(dpkg --print-architecture).qcow2"
 
-# Where to work (avoid /tmp to keep libguestfs happy)
-WORKDIR="/root/flipfeso-build"
+# Where to store the image
+WORKDIR="/root/flipfeso-cloud"
+SSHKEY_FILE="/root/flipfeso-sshkey.pub"
 
 ######################################
 
-# Pretty printing
 YW="$(echo "\033[33m")"
 BL="$(echo "\033[36m")"
 RD="$(echo "\033[01;31m")"
@@ -41,13 +42,13 @@ GN="$(echo "\033[1;92m")"
 CL="$(echo "\033[m")"
 BOLD="$(echo "\033[1m")"
 
-function msg_info()  { echo -e "${YW}[INFO]${CL} $*"; }
-function msg_ok()    { echo -e "${GN}[ OK ]${CL} $*"; }
-function msg_err()   { echo -e "${RD}[ERR ]${CL} $*"; }
+msg_info()  { echo -e "${YW}[INFO]${CL} $*"; }
+msg_ok()    { echo -e "${GN}[ OK ]${CL} $*"; }
+msg_err()   { echo -e "${RD}[ERR ]${CL} $*"; }
 
-function header_info() {
+header_info() {
   clear
-  cat <<"EOF2"
+  cat <<"EOF"
    ______ _ _       _____            _                
   |  ____(_) |     |  __ \          | |               
   | |__   _| | ___ | |__) |___  __ _| | ___  ___ _ __ 
@@ -55,29 +56,25 @@ function header_info() {
   | |    | | | (_) | | \ \  __/ (_| | |  __/  __/ |   
   |_|    |_|_|\___/|_|  \_\___|\__,_|_|\___|\___|_|   
 
-   FlipFeso Debian 12 Production VM Builder
-EOF2
+   FlipFeso Debian 12 Production VM Builder (cloud-init)
+EOF
 }
 
-######################################
-# Sanity checks
-######################################
-
-function require_root() {
+require_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
     msg_err "Please run this script as root."
     exit 1
   fi
 }
 
-function check_pve() {
+check_pve() {
   if ! command -v pveversion &>/dev/null; then
     msg_err "This script must be run on a Proxmox VE node."
     exit 1
   fi
 }
 
-function check_arch() {
+check_arch() {
   local arch
   arch="$(dpkg --print-architecture)"
   if [[ "$arch" != "amd64" ]]; then
@@ -86,15 +83,11 @@ function check_arch() {
   fi
 }
 
-######################################
-# Helpers
-######################################
-
-function get_next_vmid() {
+get_next_vmid() {
   pvesh get /cluster/nextid
 }
 
-function pick_storage() {
+pick_storage() {
   msg_info "Detecting storage pools that support disk images..."
   local menu=()
   local line tag type free item maxlen=0
@@ -140,15 +133,11 @@ function pick_storage() {
   msg_ok "Using storage: ${BL}${STORAGE}${CL}"
 }
 
-function generate_mac() {
+generate_mac() {
   printf '02:%02X:%02X:%02X:%02X:%02X\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
 }
 
-######################################
-# SSH key handling
-######################################
-
-function get_ssh_key() {
+get_ssh_key() {
   local PUBKEY=""
 
   if command -v whiptail &>/dev/null; then
@@ -172,23 +161,7 @@ function get_ssh_key() {
   echo "$PUBKEY"
 }
 
-######################################
-# Image preparation
-######################################
-
-function ensure_libguestfs() {
-  if ! command -v virt-customize &>/dev/null; then
-    msg_info "Installing libguestfs-tools on Proxmox host..."
-    apt-get -qq update >/dev/null
-    apt-get -qq install -y libguestfs-tools lsb-release >/dev/null
-    apt-get -qq install -y dhcpcd-base >/dev/null 2>&1 || true
-    msg_ok "libguestfs-tools installed."
-  fi
-
-  export LIBGUESTFS_BACKEND=direct
-}
-
-function download_debian_image() {
+download_debian_image() {
   mkdir -p "$WORKDIR"
   local img_file="${WORKDIR}/$(basename "${DEBIAN_CLOUD_URL}")"
 
@@ -203,52 +176,12 @@ function download_debian_image() {
   echo "$img_file"
 }
 
-function customize_image() {
-  local img_file="$1"
-  local hostname="$2"
-  local pubkey="$3"
-
-  msg_info "Customizing image (Docker, guest-agent, SSH keys, hostname)..."
-
-  virt-customize -q -a "$img_file" \
-    --install qemu-guest-agent,apt-transport-https,ca-certificates,curl,gnupg,software-properties-common,lsb-release \
-    --run-command "mkdir -p /etc/apt/keyrings && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg" \
-    --run-command "echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable' > /etc/apt/sources.list.d/docker.list" \
-    --run-command "apt-get update -qq && apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin" \
-    --run-command "systemctl enable docker" \
-    --hostname "$hostname" \
-    --ssh-inject "debian:string:${pubkey}" \
-    --ssh-inject "root:string:${pubkey}" \
-    --run-command "mkdir -p /root/.ssh /home/debian/.ssh && chmod 700 /root/.ssh /home/debian/.ssh && chown debian:debian /home/debian/.ssh" \
-    --run-command "echo -n > /etc/machine-id"
-
-  msg_ok "Image customized successfully."
-}
-
-function expand_image() {
-  local img_file="$1"
-  local size="$2"
-
-  msg_info "Expanding root filesystem to ${size}..."
-
-  local expanded="${img_file%.qcow2}-expanded.qcow2"
-
-  qemu-img create -f qcow2 "$expanded" "$size" >/dev/null 2>&1
-  virt-resize --expand /dev/sda1 "$img_file" "$expanded" >/dev/null 2>&1
-  mv "$expanded" "$img_file"
-
-  msg_ok "Image expanded."
-}
-
-######################################
-# VM creation
-######################################
-
-function create_vm() {
+create_vm() {
   local vmid="$1"
   local img_file="$2"
   local storage="$3"
   local mac_addr="$4"
+  local sshkey_file="$5"
 
   msg_info "Creating VM ID ${vmid} (${VM_NAME})..."
 
@@ -280,13 +213,25 @@ function create_vm() {
   qm set "$vmid" --scsi0 "$disk,discard=on,ssd=1" >/dev/null
   msg_ok "Attached disk as scsi0: ${disk}"
 
-  qm set "$vmid" --efidisk0 "${storage}:1,efitype=4m,pre-enrolled-keys=1" >/dev/null
-  msg_ok "EFI disk added."
+  # Add cloud-init drive
+  qm set "$vmid" --ide2 "${storage}:cloudinit" >/dev/null
+  msg_ok "Cloud-init drive added."
 
-  qm set "$vmid" --boot order=scsi0 >/dev/null
+  # Set hostname, SSH key, and enable DHCP
+  qm set "$vmid" \
+    --ciuser debian \
+    --sshkey "$sshkey_file" \
+    --hostname "$VM_NAME" \
+    --ipconfig0 ip=dhcp >/dev/null
+
+  # Resize disk to desired size (cloud-init/growpart should grow FS on first boot)
   qm resize "$vmid" scsi0 "$DISK_SIZE" >/dev/null 2>&1 || true
+  msg_ok "Disk resized to ${DISK_SIZE}."
 
-  msg_ok "VM ${vmid} (${VM_NAME}) created successfully."
+  # Set boot order
+  qm set "$vmid" --boot order=scsi0 >/dev/null
+
+  msg_ok "VM ${vmid} (${VM_NAME}) created and configured with cloud-init."
 }
 
 ######################################
@@ -316,16 +261,18 @@ fi
 pick_storage
 MAC_ADDR="$(generate_mac)"
 PUBKEY="$(get_ssh_key)"
-ensure_libguestfs
+
+# Save SSH key to file for qm --sshkey
+echo "$PUBKEY" > "$SSHKEY_FILE"
+chmod 600 "$SSHKEY_FILE"
+msg_ok "SSH key saved to ${SSHKEY_FILE}"
 
 IMG_FILE="$(download_debian_image)"
-customize_image "$IMG_FILE" "$VM_NAME" "$PUBKEY"
-expand_image "$IMG_FILE" "$DISK_SIZE"
 
 VMID="$(get_next_vmid)"
 msg_ok "Using VM ID: ${BL}${VMID}${CL}  MAC: ${BL}${MAC_ADDR}${CL}"
 
-create_vm "$VMID" "$IMG_FILE" "$STORAGE" "$MAC_ADDR"
+create_vm "$VMID" "$IMG_FILE" "$STORAGE" "$MAC_ADDR" "$SSHKEY_FILE"
 
 msg_info "Starting VM ${VMID}..."
 qm start "$VMID"
@@ -338,9 +285,8 @@ echo "Name:    $VM_NAME"
 echo "Bridge:  $BRIDGE"
 echo "Storage: $STORAGE"
 echo
-echo "Next steps:"
-echo "  1) Find the VM's IP (via DHCP leases or Proxmox console)."
-echo "  2) SSH using your existing PuTTY private key to user 'debian' or 'root'."
-EOF
-
-chmod +x flipfeso-build.sh
+echo "After it boots and gets a DHCP IP:"
+echo "  - SSH as user 'debian' using your PuTTY private key."
+echo "  - Then install Docker with:"
+echo "        sudo apt-get update"
+echo "        sudo apt-get install -y docker.io docker-compose-plugin"
